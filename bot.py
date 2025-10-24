@@ -91,6 +91,20 @@ def build_rsvp_markup(event_id: int) -> types.InlineKeyboardMarkup:
     return markup
 
 
+def build_main_menu_markup() -> types.InlineKeyboardMarkup:
+    markup = types.InlineKeyboardMarkup()
+    markup.row(
+        types.InlineKeyboardButton("➕ Create Event", callback_data="menu:new")
+    )
+    markup.row(
+        types.InlineKeyboardButton("📋 My Events", callback_data="menu:my")
+    )
+    markup.row(
+        types.InlineKeyboardButton("ℹ️ Help", callback_data="menu:help")
+    )
+    return markup
+
+
 def build_event_text(
     event: Dict[str, str],
     user_status: Optional[str] = None,
@@ -145,6 +159,54 @@ def prompt_for_step(chat_id: int, step: str) -> None:
 
 def reset_state(user_id: int) -> None:
     user_states.pop(user_id, None)
+
+
+def send_main_menu(chat_id: int, text: str) -> None:
+    bot.send_message(
+        chat_id,
+        text,
+        reply_markup=build_main_menu_markup(),
+    )
+
+
+def start_event_creation(user_id: int, chat_id: int, chat_type: str) -> None:
+    if chat_type != "private":
+        bot.send_message(chat_id, "Please start a private chat with me to create events.")
+        return
+    user_states[user_id] = EventCreationState()
+    prompt_for_step(chat_id, "title")
+
+
+def send_help(chat_id: int) -> None:
+    send_main_menu(
+        chat_id,
+        "Here's what I can help with:\n• Plan a new event for tomorrow\n• Review events you've already created\n• Share invites so friends can RSVP\n\nUse the buttons below to pick what you need.",
+    )
+
+
+def send_user_events(chat_id: int, user_id: int, chat_type: str) -> None:
+    if chat_type != "private":
+        bot.send_message(chat_id, "Please open a private chat to view your events.")
+        return
+
+    events = db.get_events_by_user(user_id)
+    if not events:
+        bot.send_message(chat_id, "You haven't created any events yet. Use the buttons to start.")
+        send_main_menu(chat_id, "Ready to plan something new?")
+        return
+
+    for event in events:
+        summary = f"<b>{escape_html(str(event['title']))}</b> — {escape_html(str(event['time']))} ({escape_html(str(event['type']))})"
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            types.InlineKeyboardButton("View", callback_data=f"view:{event['id']}")
+        )
+        markup.row(
+            types.InlineKeyboardButton("Delete", callback_data=f"delete:{event['id']}")
+        )
+        bot.send_message(chat_id, summary, reply_markup=markup)
+
+    send_main_menu(chat_id, "Need to do anything else?")
 
 
 def user_has_access(event_row: Dict[str, str], user_id: int) -> bool:
@@ -214,28 +276,20 @@ def handle_start(message: types.Message) -> None:
         handle_join_event(message, event_id)
         return
 
-    bot.send_message(
+    send_main_menu(
         message.chat.id,
-        "Hi! I'm Tomorrow Planner. Use /new to create an event for tomorrow or /help for all commands.",
+        "Hi! I'm Tomorrow Planner. Use the buttons below to create or manage events.",
     )
 
 
 @bot.message_handler(commands=["help"])
 def handle_help(message: types.Message) -> None:
-    bot.send_message(
-        message.chat.id,
-        "Commands:\n/new – create an event for tomorrow\n/my – manage events you created\n/help – show this help message",
-    )
+    send_help(message.chat.id)
 
 
 @bot.message_handler(commands=["new"])
 def handle_new(message: types.Message) -> None:
-    if message.chat.type != "private":
-        bot.reply_to(message, "Please start a private chat with me to create events.")
-        return
-
-    user_states[message.from_user.id] = EventCreationState()
-    prompt_for_step(message.chat.id, "title")
+    start_event_creation(message.from_user.id, message.chat.id, message.chat.type)
 
 
 @bot.message_handler(commands=["cancel"])
@@ -249,25 +303,7 @@ def handle_cancel(message: types.Message) -> None:
 
 @bot.message_handler(commands=["my"])
 def handle_my(message: types.Message) -> None:
-    if message.chat.type != "private":
-        bot.reply_to(message, "Please open a private chat to view your events.")
-        return
-
-    events = db.get_events_by_user(message.from_user.id)
-    if not events:
-        bot.send_message(message.chat.id, "You haven't created any events yet. Use /new to start.")
-        return
-
-    for event in events:
-        summary = f"<b>{escape_html(str(event['title']))}</b> — {escape_html(str(event['time']))} ({escape_html(str(event['type']))})"
-        markup = types.InlineKeyboardMarkup()
-        markup.row(
-            types.InlineKeyboardButton("View", callback_data=f"view:{event['id']}")
-        )
-        markup.row(
-            types.InlineKeyboardButton("Delete", callback_data=f"delete:{event['id']}")
-        )
-        bot.send_message(message.chat.id, summary, reply_markup=markup)
+    send_user_events(message.chat.id, message.from_user.id, message.chat.type)
 
 
 @bot.message_handler(func=lambda msg: msg.from_user.id in user_states, content_types=["text", "location"])
@@ -395,9 +431,26 @@ def handle_rsvp_callback(call: types.CallbackQuery, event_id: int, status: str) 
     bot.answer_callback_query(call.id, f"RSVP set to {status.title()}.")
 
 
+def handle_menu_callback(call: types.CallbackQuery, action: str) -> None:
+    if action == "new":
+        bot.answer_callback_query(call.id)
+        start_event_creation(call.from_user.id, call.message.chat.id, call.message.chat.type)
+    elif action == "my":
+        bot.answer_callback_query(call.id)
+        send_user_events(call.message.chat.id, call.from_user.id, call.message.chat.type)
+    elif action == "help":
+        bot.answer_callback_query(call.id)
+        send_help(call.message.chat.id)
+    else:
+        bot.answer_callback_query(call.id)
+
+
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call: types.CallbackQuery) -> None:
-    if call.data.startswith("view:"):
+    if call.data.startswith("menu:"):
+        action = call.data.split(":", maxsplit=1)[1]
+        handle_menu_callback(call, action)
+    elif call.data.startswith("view:"):
         try:
             event_id = int(call.data.split(":", maxsplit=1)[1])
         except ValueError:
